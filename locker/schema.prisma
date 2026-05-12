@@ -1,0 +1,162 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+  url      = env("DATABASE_URL")
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum OrderStatus {
+  PENDING
+  SHIPPED
+  COMPLETED
+  CANCELLED
+}
+
+model User {
+  id              String   @id @default(uuid())
+  username        String   @unique
+  email           String   @unique
+  passwordHash    String
+  bio             String?
+  profileImage    String?
+  rating          Float    @default(0)
+  createdAt       DateTime @default(now())
+  stripeAccountId String? // CONNECT ACCOUNT
+
+  listings        Listing[]
+  ordersBought    Order[]    @relation("buyerOrders")
+  ordersSold      Order[]    @relation("sellerOrders")
+  reviewsGiven    Review[]   @relation("reviewsGiven")
+  reviewsReceived Review[]   @relation("reviewsReceived")
+  wishlist        Wishlist[]
+  chatRoomsBuyer  ChatRoom[] @relation("buyerRooms")
+  chatRoomsSeller ChatRoom[] @relation("sellerRooms")
+  messages        Message[] // FIX: Added inverse relation for Message
+}
+
+model Listing {
+  id       String @id @default(uuid())
+  seller   User   @relation(fields: [sellerId], references: [id])
+  sellerId String
+
+  title       String
+  description String
+  price       Float
+  condition   String
+  groupName   String
+  memberName  String
+  era         String?
+  isSold      Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  images     ListingImage[]
+  orders     Order[]
+  wishlist   Wishlist[]
+  chatRooms  ChatRoom[] // FIX: Added inverse relation for ChatRoom
+  featuredIn FeaturedItem[] // FIX: Added inverse relation for FeaturedItem
+}
+
+model ListingImage {
+  id        String  @id @default(uuid())
+  url       String
+  listing   Listing @relation(fields: [listingId], references: [id])
+  listingId String
+}
+
+model Order {
+  id        String  @id @default(uuid())
+  listing   Listing @relation(fields: [listingId], references: [id])
+  listingId String
+
+  buyer   User   @relation("buyerOrders", fields: [buyerId], references: [id])
+  buyerId String
+
+  seller   User   @relation("sellerOrders", fields: [sellerId], references: [id])
+  sellerId String
+
+  stripePaymentId String?
+  amount          Float
+  platformFee     Float
+
+  status    OrderStatus @default(PENDING)
+  createdAt DateTime    @default(now())
+
+  review Review?
+}
+
+model Review {
+  id         String  @id @default(uuid())
+  rating     Int
+  comment    String
+  proofImage String?
+
+  reviewer   User   @relation("reviewsGiven", fields: [reviewerId], references: [id])
+  reviewerId String
+
+  reviewed   User   @relation("reviewsReceived", fields: [reviewedId], references: [id])
+  reviewedId String
+
+  order   Order  @relation(fields: [orderId], references: [id])
+  orderId String @unique // FIX: Added @unique constraint for 1-to-1 relation
+
+  createdAt DateTime @default(now())
+}
+
+model Wishlist {
+  id     String @id @default(uuid())
+  user   User   @relation(fields: [userId], references: [id])
+  userId String
+
+  listing   Listing @relation(fields: [listingId], references: [id])
+  listingId String
+}
+
+model ChatRoom {
+  id        String   @id @default(uuid())
+  buyer     User     @relation("buyerRooms", fields: [buyerId], references: [id])
+  buyerId   String
+  seller    User     @relation("sellerRooms", fields: [sellerId], references: [id])
+  sellerId  String
+  listing   Listing  @relation(fields: [listingId], references: [id])
+  listingId String
+  createdAt DateTime @default(now())
+
+  messages Message[]
+}
+
+model Message {
+  id         String   @id @default(uuid())
+  chatRoom   ChatRoom @relation(fields: [chatRoomId], references: [id])
+  chatRoomId String
+
+  sender   User   @relation(fields: [senderId], references: [id])
+  senderId String
+
+  content   String
+  createdAt DateTime @default(now())
+}
+
+model FeaturedCollection {
+  id          String         @id @default(uuid())
+  title       String
+  description String?
+  bannerImage String?
+  items       FeaturedItem[]
+}
+
+model FeaturedItem {
+  id           String             @id @default(uuid())
+  collection   FeaturedCollection @relation(fields: [collectionId], references: [id])
+  collectionId String
+
+  listing   Listing @relation(fields: [listingId], references: [id])
+  listingId String
+}

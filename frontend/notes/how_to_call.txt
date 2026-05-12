@@ -1,0 +1,42 @@
+photocard_scroller.dart:
+PhotocardScroller(
+  photocards: photocards,
+  maxCards: 5, // optional
+  ), 
+
+
+poster_scroller.dart:
+PosterScroller(
+  imageUrls: [
+    'https://sc0.blr1.cdn.digitaloceanspaces.com/article/208926-qlsfcbbgnj-1755763350.jpg',
+    'https://ichef.bbci.co.uk/news/1024/cpsprodpb/34b3/live/3bd8a6c0-97be-11f0-8dc1-71b42b012d5c.jpg.webp',
+    'https://images.indianexpress.com/2025/11/Kerala-vande-bharat-2.jpg?w=640',
+  ],
+  maxImages: 5,
+),
+
+
+banner_grid.dart:
+BannerGrid(imageUrls: [
+    'https://sc0.blr1.cdn.digitaloceanspaces.com/article/208926-qlsfcbbgnj-1755763350.jpg',
+    'https://ichef.bbci.co.uk/news/1024/cpsprodpb/34b3/live/3bd8a6c0-97be-11f0-8dc1-71b42b012d5c.jpg.webp',
+    'https://images.indianexpress.com/2025/11/Kerala-vande-bharat-2.jpg?w=640',
+  ], 
+  crossAxisCountVariable: crossAxisCount)
+
+card_carousel.dart:
+[PhotoCarousel(
+  imageUrls: photocards.map((p) => p.imageUrl).toList(),
+) ],
+
+
+search_bar.dart:
+AppSearchBar(
+                        controller: searchController,
+                        hint: "Search photocards...",
+                        onChanged: (value) {
+                          // live search later if you want
+                        },
+                        onSubmit: () {
+                          // when user taps search icon or Enter
+                        },

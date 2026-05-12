@@ -1,0 +1,20 @@
+import 'widgets/listing_card.dart';
+
+  GridView.builder(
+    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+      crossAxisCount: crossAxisCount,
+      mainAxisSpacing: 1,
+      crossAxisSpacing: 1,
+      childAspectRatio: 2/3, // tweak to make your cards taller/shorter
+    ),
+    itemCount: photocards.length,
+    itemBuilder: (context, index) {
+      final photocard = photocards[index];
+      return ListingCard(
+        title: photocard.title,
+        subtitle: photocard.description,
+        imageUrl: photocard.imageUrl,
+        price: photocard.price,
+      );
+    },
+  ),

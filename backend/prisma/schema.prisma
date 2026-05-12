@@ -1,0 +1,98 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum UserRole {
+  USER
+  MODERATOR
+  ADMIN
+}
+
+enum Condition {
+  MINT
+  NEAR_MINT
+  GOOD
+  FAIR
+}
+
+model User {
+  id           String @id @default(uuid())
+  email        String @unique
+  username     String @unique
+  passwordHash String
+
+  role       UserRole @default(USER)
+  isVerified Boolean  @default(false)
+
+  listings    Listing[]
+  tagsCreated Tag[]     @relation("UserCreatedTags")
+
+  createdAt DateTime @default(now())
+}
+
+model Listing {
+  id String @id @default(uuid())
+
+  title       String
+  description String
+  price       Float
+
+  condition Condition
+
+  sellerCountry   String
+  shipsWorldwide  Boolean          @default(false)
+  shippingRegions ShippingRegion[]
+  isSold          Boolean          @default(false)
+
+  seller   User   @relation(fields: [sellerId], references: [id])
+  sellerId String
+
+  tags ListingTag[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Tag {
+  id   String @id @default(uuid())
+  name String
+  slug String @unique
+
+  approved   Boolean @default(false)
+  usageCount Int     @default(0)
+
+  createdById String?
+  createdBy   User?   @relation("UserCreatedTags", fields: [createdById], references: [id])
+
+  listings ListingTag[]
+
+  createdAt DateTime @default(now())
+}
+
+model ListingTag {
+  listing   Listing @relation(fields: [listingId], references: [id])
+  listingId String
+
+  tag   Tag    @relation(fields: [tagId], references: [id])
+  tagId String
+
+  @@id([listingId, tagId])
+}
+
+model ShippingRegion {
+  id        String  @id @default(uuid())
+  country   String
+  listing   Listing @relation(fields: [listingId], references: [id])
+  listingId String
+}

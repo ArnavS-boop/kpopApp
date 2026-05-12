@@ -1,0 +1,677 @@
+import express, { Request, Response, NextFunction } from "express";
+import { createServer } from "http";
+import { Server as SocketIOServer, Socket } from "socket.io";
+import { PrismaClient, OrderStatus } from "../generated/prisma/index.js";
+import { PrismaPg } from "@prisma/adapter-pg";
+import pg from "pg";
+import bcrypt from "bcrypt";
+import jwt, { JwtPayload } from "jsonwebtoken";
+import Stripe from "stripe";
+import { v2 as cloudinary } from "cloudinary";
+import multer from "multer";
+import { Readable } from "stream";
+import cors from "cors";
+import rateLimit from "express-rate-limit";
+import { z, ZodError } from "zod";
+
+// ─── ENV VALIDATION (fail fast) ──────────────────────────────────────────────
+const EnvSchema = z.object({
+  DATABASE_URL:           z.string().min(1),
+  JWT_SECRET:             z.string().min(16),
+  STRIPE_SECRET_KEY:      z.string().startsWith("sk_"),
+  STRIPE_WEBHOOK_SECRET:  z.string().startsWith("whsec_"),
+  CLOUDINARY_CLOUD_NAME:  z.string().min(1),
+  CLOUDINARY_API_KEY:     z.string().min(1),
+  CLOUDINARY_API_SECRET:  z.string().min(1),
+  PORT:                   z.string().regex(/^\d+$/).default("3000"),
+  CLIENT_URL:             z.string().url().default("http://localhost:5173"),
+});
+
+const env = (() => {
+  const result = EnvSchema.safeParse(process.env);
+  if (!result.success) {
+    console.error("❌ Missing or invalid environment variables:");
+    for (const issue of result.error.issues) {
+      console.error(`   ${issue.path.join(".")}: ${issue.message}`);
+    }
+    process.exit(1);
+  }
+  return result.data;
+})();
+
+// ─── PRISMA (adapter mode) ────────────────────────────────────────────────────
+const pool    = new pg.Pool({ connectionString: env.DATABASE_URL });
+const adapter = new PrismaPg(pool);
+const prisma  = new PrismaClient({ adapter });
+
+// ─── STRIPE ───────────────────────────────────────────────────────────────────
+const stripe = new Stripe(env.STRIPE_SECRET_KEY);
+
+// ─── CLOUDINARY ───────────────────────────────────────────────────────────────
+cloudinary.config({
+  cloud_name: env.CLOUDINARY_CLOUD_NAME,
+  api_key:    env.CLOUDINARY_API_KEY,
+  api_secret: env.CLOUDINARY_API_SECRET,
+});
+
+// ─── EXPRESS + SOCKET.IO ─────────────────────────────────────────────────────
+const app        = express();
+const httpServer = createServer(app);
+const io         = new SocketIOServer(httpServer, {
+  cors: { origin: env.CLIENT_URL, credentials: true },
+});
+
+app.use(cors({ origin: env.CLIENT_URL, credentials: true }));
+
+// ─── STRIPE WEBHOOK (raw body – must precede express.json) ────────────────────
+app.post(
+  "/webhooks/stripe",
+  express.raw({ type: "application/json" }),
+  async (req: Request, res: Response): Promise<void> => {
+    const sig = req.headers["stripe-signature"];
+    if (!sig || typeof sig !== "string") {
+      res.status(400).send("Missing stripe-signature header");
+      return;
+    }
+
+    let event: Stripe.Event;
+    try {
+      event = stripe.webhooks.constructEvent(req.body as Buffer, sig, env.STRIPE_WEBHOOK_SECRET);
+    } catch {
+      res.status(400).send("Webhook signature verification failed");
+      return;
+    }
+
+    if (event.type === "payment_intent.succeeded") {
+      const pi        = event.data.object as Stripe.PaymentIntent;
+      const orderId   = pi.metadata["orderId"];
+      const listingId = pi.metadata["listingId"];
+
+      // Deterministic: use metadata IDs, no join-scan fallback
+      if (orderId && listingId) {
+        await prisma.$transaction([
+          prisma.order.update({
+            where: { id: orderId },
+            data:  { status: OrderStatus.COMPLETED },
+          }),
+          prisma.listing.update({
+            where: { id: listingId },
+            data:  { isSold: true },
+          }),
+        ]);
+      }
+    }
+
+    res.json({ received: true });
+  }
+);
+
+app.use(express.json());
+
+// ─── MULTER ───────────────────────────────────────────────────────────────────
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits:  { fileSize: 10 * 1024 * 1024 },
+});
+
+async function uploadToCloudinary(buffer: Buffer, folder: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream({ folder }, (err, result) => {
+      if (err || !result) return reject(err ?? new Error("Cloudinary upload failed"));
+      resolve(result.secure_url);
+    });
+    Readable.from(buffer).pipe(stream);
+  });
+}
+
+// ─── ZOD SCHEMAS ─────────────────────────────────────────────────────────────
+const RegisterSchema = z.object({
+  username: z.string().min(3).max(32).regex(/^\w+$/, "Alphanumeric + underscore only"),
+  email:    z.string().email(),
+  password: z.string().min(8).max(128),
+});
+
+const LoginSchema = z.object({
+  email:    z.string().email(),
+  password: z.string().min(1),
+});
+
+const LISTING_CONDITIONS = ["NEW", "LIKE_NEW", "GOOD", "FAIR", "POOR"] as const;
+
+const ListingCreateSchema = z.object({
+  title:       z.string().min(1).max(120),
+  description: z.string().min(1).max(2000),
+  price:       z.coerce.number().positive().max(100_000),
+  condition:   z.enum(LISTING_CONDITIONS),
+  groupName:   z.string().min(1).max(80),
+  memberName:  z.string().min(1).max(80),
+  era:         z.string().max(40).optional(),
+});
+
+const ListingUpdateSchema = z.object({
+  title:       z.string().min(1).max(120).optional(),
+  description: z.string().min(1).max(2000).optional(),
+  price:       z.coerce.number().positive().max(100_000).optional(),
+  condition:   z.enum(LISTING_CONDITIONS).optional(),
+  groupName:   z.string().min(1).max(80).optional(),
+  memberName:  z.string().min(1).max(80).optional(),
+  era:         z.string().max(40).optional(),
+});
+
+const OrderCreateSchema = z.object({
+  listingId: z.string().uuid(),
+});
+
+const ReviewCreateSchema = z.object({
+  orderId:    z.string().uuid(),
+  rating:     z.number().int().min(1).max(5),
+  comment:    z.string().min(1).max(1000),
+  proofImage: z.string().url().optional(),
+});
+
+const ListingQuerySchema = z.object({
+  groupName: z.string().optional(),
+  era:       z.string().optional(),
+  condition: z.string().optional(),
+  minPrice:  z.coerce.number().nonnegative().optional(),
+  maxPrice:  z.coerce.number().positive().optional(),
+  page:      z.coerce.number().int().positive().default(1),
+  limit:     z.coerce.number().int().min(1).max(100).default(20),
+});
+
+const OrderQuerySchema = z.object({
+  role: z.enum(["buyer", "seller"]).default("buyer"),
+});
+
+// ─── VALIDATION HELPER ────────────────────────────────────────────────────────
+function validate<T>(schema: z.ZodSchema<T>, data: unknown): { data: T } | { error: string } {
+  const result = schema.safeParse(data);
+  if (!result.success) {
+    const msg = result.error.issues
+      .map((i) => `${i.path.join(".")}: ${i.message}`)
+      .join("; ");
+    return { error: msg };
+  }
+  return { data: result.data };
+}
+
+// ─── AUTH TYPES + MIDDLEWARE ──────────────────────────────────────────────────
+interface AuthRequest extends Request {
+  userId: string;
+}
+
+interface AuthSocket extends Socket {
+  userId: string;
+}
+
+function auth(req: Request, res: Response, next: NextFunction): void {
+  const token = req.headers.authorization?.split(" ")[1];
+  if (!token) { res.status(401).json({ error: "Unauthorized" }); return; }
+  try {
+    const payload = jwt.verify(token, env.JWT_SECRET) as JwtPayload;
+    if (typeof payload.sub !== "string") throw new Error("Bad token payload");
+    (req as AuthRequest).userId = payload.sub;
+    next();
+  } catch {
+    res.status(401).json({ error: "Invalid token" });
+  }
+}
+
+// ─── RATE LIMITING ────────────────────────────────────────────────────────────
+const authLimiter = rateLimit({
+  windowMs:        15 * 60 * 1000, // 15 min
+  max:             20,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  message:         { error: "Too many requests, please try again later" },
+});
+
+// ─── AUTH ROUTES ─────────────────────────────────────────────────────────────
+app.post("/auth/register", authLimiter, async (req: Request, res: Response): Promise<void> => {
+  const parsed = validate(RegisterSchema, req.body);
+  if ("error" in parsed) { res.status(400).json({ error: parsed.error }); return; }
+  const { username, email, password } = parsed.data;
+
+  const passwordHash = await bcrypt.hash(password, 12);
+  try {
+    const user  = await prisma.user.create({ data: { username, email, passwordHash } });
+    const token = jwt.sign({ sub: user.id }, env.JWT_SECRET, { expiresIn: "7d" });
+    res.status(201).json({ token, user: { id: user.id, username: user.username, email: user.email } });
+  } catch {
+    res.status(409).json({ error: "Username or email already taken" });
+  }
+});
+
+app.post("/auth/login", authLimiter, async (req: Request, res: Response): Promise<void> => {
+  const parsed = validate(LoginSchema, req.body);
+  if ("error" in parsed) { res.status(400).json({ error: parsed.error }); return; }
+  const { email, password } = parsed.data;
+
+  const user = await prisma.user.findUnique({ where: { email } });
+  if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+    res.status(401).json({ error: "Invalid credentials" }); return;
+  }
+  const token = jwt.sign({ sub: user.id }, env.JWT_SECRET, { expiresIn: "7d" });
+  res.json({ token, user: { id: user.id, username: user.username, email: user.email } });
+});
+
+// ─── USER ROUTES ──────────────────────────────────────────────────────────────
+app.get("/users/:id", async (req: Request, res: Response): Promise<void> => {
+  const user = await prisma.user.findUnique({
+    where:  { id: req.params.id },
+    select: { id: true, username: true, bio: true, profileImage: true, rating: true, createdAt: true },
+  });
+  if (!user) { res.status(404).json({ error: "Not found" }); return; }
+  res.json(user);
+});
+
+app.patch(
+  "/users/me",
+  auth,
+  upload.single("profileImage"),
+  async (req: Request, res: Response): Promise<void> => {
+    const { userId } = req as AuthRequest;
+    const { bio, username } = req.body as { bio?: string; username?: string };
+    let profileImage: string | undefined;
+    if (req.file) profileImage = await uploadToCloudinary(req.file.buffer, "profiles");
+
+    const user = await prisma.user.update({
+      where:  { id: userId },
+      data:   {
+        ...(bio          && { bio }),
+        ...(username     && { username }),
+        ...(profileImage && { profileImage }),
+      },
+      select: { id: true, username: true, bio: true, profileImage: true, rating: true },
+    });
+    res.json(user);
+  }
+);
+
+app.get("/users/:id/reviews", async (req: Request, res: Response): Promise<void> => {
+  const reviews = await prisma.review.findMany({
+    where:   { reviewedId: req.params.id },
+    include: { reviewer: { select: { id: true, username: true, profileImage: true } } },
+    orderBy: { createdAt: "desc" },
+  });
+  res.json(reviews);
+});
+
+// ─── LISTING ROUTES ───────────────────────────────────────────────────────────
+app.get("/listings", async (req: Request, res: Response): Promise<void> => {
+  const parsed = validate(ListingQuerySchema, req.query);
+  if ("error" in parsed) { res.status(400).json({ error: parsed.error }); return; }
+  const { groupName, era, condition, minPrice, maxPrice, page, limit } = parsed.data;
+
+  const listings = await prisma.listing.findMany({
+    where: {
+      isSold: false,
+      ...(groupName && { groupName: { contains: groupName, mode: "insensitive" } }),
+      ...(era       && { era }),
+      ...(condition && { condition }),
+      ...((minPrice !== undefined || maxPrice !== undefined) && {
+        price: {
+          ...(minPrice !== undefined && { gte: minPrice }),
+          ...(maxPrice !== undefined && { lte: maxPrice }),
+        },
+      }),
+    },
+    include: { images: true, seller: { select: { id: true, username: true, rating: true } } },
+    orderBy: { createdAt: "desc" },
+    skip:    (page - 1) * limit,
+    take:    limit,
+  });
+  res.json(listings);
+});
+
+app.get("/listings/:id", async (req: Request, res: Response): Promise<void> => {
+  const listing = await prisma.listing.findUnique({
+    where:   { id: req.params.id },
+    include: {
+      images: true,
+      seller: { select: { id: true, username: true, profileImage: true, rating: true } },
+    },
+  });
+  if (!listing) { res.status(404).json({ error: "Not found" }); return; }
+  res.json(listing);
+});
+
+app.post(
+  "/listings",
+  auth,
+  upload.array("images", 10),
+  async (req: Request, res: Response): Promise<void> => {
+    const { userId } = req as AuthRequest;
+    const parsed = validate(ListingCreateSchema, req.body);
+    if ("error" in parsed) { res.status(400).json({ error: parsed.error }); return; }
+
+    const files     = (req.files ?? []) as Express.Multer.File[];
+    const imageUrls = await Promise.all(files.map((f) => uploadToCloudinary(f.buffer, "listings")));
+
+    const listing = await prisma.listing.create({
+      data: {
+        ...parsed.data,
+        sellerId: userId,
+        images:   { create: imageUrls.map((url) => ({ url })) },
+      },
+      include: { images: true },
+    });
+    res.status(201).json(listing);
+  }
+);
+
+app.patch("/listings/:id", auth, async (req: Request, res: Response): Promise<void> => {
+  const { userId } = req as AuthRequest;
+  const listing = await prisma.listing.findUnique({ where: { id: req.params.id } });
+  if (!listing || listing.sellerId !== userId) { res.status(403).json({ error: "Forbidden" }); return; }
+
+  const parsed = validate(ListingUpdateSchema, req.body);
+  if ("error" in parsed) { res.status(400).json({ error: parsed.error }); return; }
+
+  // Only whitelisted fields from the schema reach the DB – no sellerId/isSold leakage
+  const updated = await prisma.listing.update({
+    where:   { id: req.params.id },
+    data:    parsed.data,
+    include: { images: true },
+  });
+  res.json(updated);
+});
+
+app.delete("/listings/:id", auth, async (req: Request, res: Response): Promise<void> => {
+  const { userId } = req as AuthRequest;
+  const listing = await prisma.listing.findUnique({ where: { id: req.params.id } });
+  if (!listing || listing.sellerId !== userId) { res.status(403).json({ error: "Forbidden" }); return; }
+  await prisma.listing.delete({ where: { id: req.params.id } });
+  res.status(204).send();
+});
+
+// ─── ORDER ROUTES ─────────────────────────────────────────────────────────────
+const PLATFORM_FEE_PERCENT = 0.1;
+
+app.post("/orders", auth, async (req: Request, res: Response): Promise<void> => {
+  const { userId } = req as AuthRequest;
+  const parsed = validate(OrderCreateSchema, req.body);
+  if ("error" in parsed) { res.status(400).json({ error: parsed.error }); return; }
+  const { listingId } = parsed.data;
+
+  const listing = await prisma.listing.findUnique({
+    where:   { id: listingId },
+    include: { seller: true },
+  });
+  if (!listing || listing.isSold)   { res.status(400).json({ error: "Listing unavailable" }); return; }
+  if (listing.sellerId === userId)  { res.status(400).json({ error: "Cannot buy your own listing" }); return; }
+
+  const platformFee = parseFloat((listing.price * PLATFORM_FEE_PERCENT).toFixed(2));
+
+  // Transaction: persist order first → attach PaymentIntent metadata → update order with PI id
+  const { order, clientSecret } = await prisma.$transaction(async (tx) => {
+    const newOrder = await tx.order.create({
+      data: {
+        listingId,
+        buyerId:    userId,
+        sellerId:   listing.sellerId,
+        amount:     listing.price,
+        platformFee,
+        status:     OrderStatus.PENDING,
+      },
+    });
+
+    const pi = await stripe.paymentIntents.create({
+      amount:                 Math.round(listing.price * 100),
+      currency:               "usd",
+      application_fee_amount: Math.round(platformFee * 100),
+      ...(listing.seller.stripeAccountId && {
+        transfer_data: { destination: listing.seller.stripeAccountId },
+      }),
+      metadata: {
+        orderId:   newOrder.id,
+        buyerId:   userId,
+        listingId,
+        sellerId:  listing.sellerId,
+      },
+    });
+
+    const updatedOrder = await tx.order.update({
+      where: { id: newOrder.id },
+      data:  { stripePaymentId: pi.id },
+    });
+
+    return { order: updatedOrder, clientSecret: pi.client_secret };
+  });
+
+  res.status(201).json({ order, clientSecret });
+});
+
+app.get("/orders/me", auth, async (req: Request, res: Response): Promise<void> => {
+  const { userId } = req as AuthRequest;
+  const parsed = validate(OrderQuerySchema, req.query);
+  if ("error" in parsed) { res.status(400).json({ error: parsed.error }); return; }
+  const { role } = parsed.data;
+
+  const orders = await prisma.order.findMany({
+    where:   role === "seller" ? { sellerId: userId } : { buyerId: userId },
+    include: { listing: { include: { images: true } } },
+    orderBy: { createdAt: "desc" },
+  });
+  res.json(orders);
+});
+
+// ─── STRIPE CONNECT ───────────────────────────────────────────────────────────
+app.post("/stripe/connect", auth, async (req: Request, res: Response): Promise<void> => {
+  const { userId } = req as AuthRequest;
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+
+  let accountId = user?.stripeAccountId;
+  if (!accountId) {
+    const account = await stripe.accounts.create({ type: "express" });
+    accountId     = account.id;
+    await prisma.user.update({ where: { id: userId }, data: { stripeAccountId: accountId } });
+  }
+
+  const link = await stripe.accountLinks.create({
+    account:     accountId,
+    refresh_url: `${env.CLIENT_URL}/stripe/refresh`,
+    return_url:  `${env.CLIENT_URL}/stripe/return`,
+    type:        "account_onboarding",
+  });
+  res.json({ url: link.url });
+});
+
+// ─── REVIEW ROUTES ────────────────────────────────────────────────────────────
+app.post("/reviews", auth, async (req: Request, res: Response): Promise<void> => {
+  const { userId } = req as AuthRequest;
+  const parsed = validate(ReviewCreateSchema, req.body);
+  if ("error" in parsed) { res.status(400).json({ error: parsed.error }); return; }
+  const { orderId, rating, comment, proofImage } = parsed.data;
+
+  const order = await prisma.order.findUnique({ where: { id: orderId } });
+  if (!order || order.buyerId !== userId)     { res.status(403).json({ error: "Forbidden" }); return; }
+  if (order.status !== OrderStatus.COMPLETED) { res.status(400).json({ error: "Order not completed" }); return; }
+
+  // Transaction: create review + recalculate rating atomically (no race between two reviewers)
+  const review = await prisma.$transaction(async (tx) => {
+    const newReview = await tx.review.create({
+      data: {
+        orderId,
+        reviewerId: userId,
+        reviewedId: order.sellerId,
+        rating,
+        comment,
+        proofImage,
+      },
+    });
+
+    const agg = await tx.review.aggregate({
+      where: { reviewedId: order.sellerId },
+      _avg:  { rating: true },
+    });
+
+    await tx.user.update({
+      where: { id: order.sellerId },
+      data:  { rating: agg._avg.rating ?? 0 },
+    });
+
+    return newReview;
+  });
+
+  res.status(201).json(review);
+});
+
+// ─── WISHLIST ROUTES ──────────────────────────────────────────────────────────
+app.get("/wishlist", auth, async (req: Request, res: Response): Promise<void> => {
+  const { userId } = req as AuthRequest;
+  const items = await prisma.wishlist.findMany({
+    where:   { userId },
+    include: { listing: { include: { images: true } } },
+  });
+  res.json(items);
+});
+
+app.post("/wishlist", auth, async (req: Request, res: Response): Promise<void> => {
+  const { userId } = req as AuthRequest;
+  const { listingId } = req.body as { listingId?: string };
+  if (!listingId) { res.status(400).json({ error: "listingId is required" }); return; }
+
+  try {
+    // @@unique([userId, listingId]) on Wishlist enforces dedup at DB level
+    const item = await prisma.wishlist.create({ data: { userId, listingId } });
+    res.status(201).json(item);
+  } catch {
+    // Unique constraint violation (P2002) → already wishlisted; return existing idempotently
+    const existing = await prisma.wishlist.findFirst({ where: { userId, listingId } });
+    res.status(200).json(existing);
+  }
+});
+
+app.delete("/wishlist/:listingId", auth, async (req: Request, res: Response): Promise<void> => {
+  const { userId } = req as AuthRequest;
+  await prisma.wishlist.deleteMany({ where: { userId, listingId: req.params.listingId } });
+  res.status(204).send();
+});
+
+// ─── CHATROOM ROUTES ──────────────────────────────────────────────────────────
+app.get("/chatrooms", auth, async (req: Request, res: Response): Promise<void> => {
+  const { userId } = req as AuthRequest;
+  const rooms = await prisma.chatRoom.findMany({
+    where:   { OR: [{ buyerId: userId }, { sellerId: userId }] },
+    include: {
+      listing:  { select: { id: true, title: true, images: { take: 1 } } },
+      buyer:    { select: { id: true, username: true, profileImage: true } },
+      seller:   { select: { id: true, username: true, profileImage: true } },
+      messages: { orderBy: { createdAt: "desc" }, take: 1 },
+    },
+    orderBy: { createdAt: "desc" },
+  });
+  res.json(rooms);
+});
+
+app.post("/chatrooms", auth, async (req: Request, res: Response): Promise<void> => {
+  const { userId } = req as AuthRequest;
+  const { listingId } = req.body as { listingId?: string };
+  if (!listingId) { res.status(400).json({ error: "listingId is required" }); return; }
+
+  const listing = await prisma.listing.findUnique({ where: { id: listingId } });
+  if (!listing)                    { res.status(404).json({ error: "Listing not found" }); return; }
+  if (listing.sellerId === userId) { res.status(400).json({ error: "Cannot chat with yourself" }); return; }
+
+  const existing = await prisma.chatRoom.findFirst({
+    where: { buyerId: userId, sellerId: listing.sellerId, listingId },
+  });
+  if (existing) { res.json(existing); return; }
+
+  const room = await prisma.chatRoom.create({
+    data: { buyerId: userId, sellerId: listing.sellerId, listingId },
+  });
+  res.status(201).json(room);
+});
+
+app.get("/chatrooms/:id/messages", auth, async (req: Request, res: Response): Promise<void> => {
+  const { userId } = req as AuthRequest;
+  const room = await prisma.chatRoom.findUnique({ where: { id: req.params.id } });
+  if (!room || (room.buyerId !== userId && room.sellerId !== userId)) {
+    res.status(403).json({ error: "Forbidden" }); return;
+  }
+  const messages = await prisma.message.findMany({
+    where:   { chatRoomId: req.params.id },
+    include: { sender: { select: { id: true, username: true, profileImage: true } } },
+    orderBy: { createdAt: "asc" },
+  });
+  res.json(messages);
+});
+
+// ─── FEATURED COLLECTIONS ─────────────────────────────────────────────────────
+app.get("/featured", async (_req: Request, res: Response): Promise<void> => {
+  const collections = await prisma.featuredCollection.findMany({
+    include: { items: { include: { listing: { include: { images: true } } } } },
+  });
+  res.json(collections);
+});
+
+// ─── SOCKET.IO ────────────────────────────────────────────────────────────────
+const userSockets = new Map<string, Set<string>>();
+
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token as string | undefined;
+  if (!token) { next(new Error("Unauthorized")); return; }
+  try {
+    const payload = jwt.verify(token, env.JWT_SECRET) as JwtPayload;
+    if (typeof payload.sub !== "string") throw new Error("Bad token payload");
+    (socket as AuthSocket).userId = payload.sub;
+    next();
+  } catch {
+    next(new Error("Invalid token"));
+  }
+});
+
+io.on("connection", (socket) => {
+  const { userId } = socket as AuthSocket;
+
+  if (!userSockets.has(userId)) userSockets.set(userId, new Set());
+  userSockets.get(userId)!.add(socket.id);
+
+  socket.on("join_room",  (roomId: string) => socket.join(roomId));
+  socket.on("leave_room", (roomId: string) => socket.leave(roomId));
+
+  socket.on(
+    "send_message",
+    async (data: { chatRoomId: string; content: string }, callback?: (msg: unknown) => void) => {
+      try {
+        const room = await prisma.chatRoom.findUnique({ where: { id: data.chatRoomId } });
+        if (!room || (room.buyerId !== userId && room.sellerId !== userId)) return;
+
+        const message = await prisma.message.create({
+          data:    { chatRoomId: data.chatRoomId, senderId: userId, content: data.content },
+          include: { sender: { select: { id: true, username: true, profileImage: true } } },
+        });
+
+        io.to(data.chatRoomId).emit("new_message", message);
+        callback?.(message);
+      } catch (err) {
+        console.error("send_message error:", err);
+      }
+    }
+  );
+
+  socket.on("disconnect", () => {
+    userSockets.get(userId)?.delete(socket.id);
+    if (userSockets.get(userId)?.size === 0) userSockets.delete(userId);
+  });
+});
+
+// ─── GLOBAL ERROR HANDLER ─────────────────────────────────────────────────────
+app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  if (err instanceof ZodError) {
+    const msg = err.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
+    res.status(400).json({ error: msg });
+    return;
+  }
+  console.error(err);
+  res.status(500).json({ error: "Internal server error" });
+});
+
+// ─── START ────────────────────────────────────────────────────────────────────
+httpServer.listen(parseInt(env.PORT), () => {
+  console.log(`🚀 Server running on port ${env.PORT}`);
+});
+
+export { app, io, prisma };

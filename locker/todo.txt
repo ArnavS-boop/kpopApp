@@ -1,0 +1,3 @@
+check reviewpage review bar size overflow on certain devices
+in seller edit make the bg cover the whole page
+check newest filter to not random sort
